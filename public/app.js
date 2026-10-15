@@ -21,6 +21,15 @@
   const srtOutput = $('srt-output');
   const downloadBtn = $('download-btn');
   const copyBtn = $('copy-btn');
+  const customModelWrap = $('custom-model-wrap');
+  const customModelInput = $('custom-model');
+  const previewSection = $('preview-section');
+  const previewList = $('preview-list');
+  const previewInfo = $('preview-info');
+  const previewAll = $('preview-all');
+  const CUSTOM = '__custom__';
+  const PREVIEW_LIMIT = 40;
+  let lastSourceSrt = '';
 
   let abortController = null;
   let resultSrt = '';
@@ -63,6 +72,21 @@
     } catch (_) {
       modelSelect.innerHTML = '<option value="gemini-2.5-flash">Gemini 2.5 Flash</option>';
     }
+    const other = document.createElement('option');
+    other.value = CUSTOM;
+    other.textContent = 'Other (enter model ID)…';
+    modelSelect.appendChild(other);
+    modelSelect.addEventListener('change', updateCustomVisibility);
+    updateCustomVisibility();
+  }
+
+  function updateCustomVisibility() {
+    customModelWrap.hidden = modelSelect.value !== CUSTOM;
+  }
+
+  function selectedModel() {
+    if (modelSelect.value === CUSTOM) return customModelInput.value.trim();
+    return modelSelect.value;
   }
 
   // ---- SRT input ----
@@ -106,8 +130,63 @@
     resultSrt = srt;
     srtOutput.value = srt;
     outputSection.hidden = false;
+    renderPreview();
     outputSection.scrollIntoView({ behavior: 'smooth', block: 'start' });
   }
+
+  // ---- Preview (client-side SRT parse, original vs translated) ----
+  function parseSrtClient(text) {
+    const blocks = text.replace(/\r/g, '').replace(/^\uFEFF/, '').trim().split(/\n\s*\n/);
+    const out = [];
+    for (const block of blocks) {
+      const lines = block.split('\n');
+      const t = lines.findIndex((l) => l.includes('-->'));
+      if (t < 0) continue;
+      out.push({ timing: lines[t].trim(), text: lines.slice(t + 1).join('\n') });
+    }
+    return out;
+  }
+
+  function renderPreview() {
+    const src = parseSrtClient(lastSourceSrt);
+    const dst = parseSrtClient(resultSrt);
+    if (!dst.length) {
+      previewSection.hidden = true;
+      return;
+    }
+    previewSection.hidden = false;
+    previewInfo.textContent = `${dst.length} subtitles`;
+    previewList.innerHTML = '';
+
+    const limit = previewAll.checked ? dst.length : Math.min(dst.length, PREVIEW_LIMIT);
+    for (let i = 0; i < limit; i++) {
+      const row = document.createElement('div');
+      row.className = 'preview-row';
+
+      const meta = document.createElement('div');
+      meta.className = 'preview-meta';
+      meta.textContent = `${i + 1} · ${dst[i].timing}`;
+
+      const orig = document.createElement('div');
+      orig.className = 'preview-orig';
+      orig.textContent = src[i] ? src[i].text : '';
+
+      const si = document.createElement('div');
+      si.className = 'preview-si';
+      si.textContent = dst[i].text;
+
+      row.append(meta, orig, si);
+      previewList.appendChild(row);
+    }
+    if (limit < dst.length) {
+      const more = document.createElement('p');
+      more.className = 'hint';
+      more.textContent = `Showing first ${limit}. Tick "Show all" to see the rest.`;
+      previewList.appendChild(more);
+    }
+  }
+
+  previewAll.addEventListener('change', renderPreview);
 
   // ---- Translate (streams NDJSON progress from the server) ----
   async function translate() {
@@ -117,9 +196,12 @@
     if (!apiKey) return setStatus('Please enter your Gemini API key.', 'error');
     if (!srt.trim()) return setStatus('Please upload or paste an SRT file.', 'error');
     if (countEntries(srt) === 0) return setStatus('This does not look like an SRT file (no "-->" timing lines found).', 'error');
+    const model = selectedModel();
+    if (!model) return setStatus('Please enter the custom model ID.', 'error');
 
     if (rememberKey.checked) localStorage.setItem(KEY_STORAGE, apiKey);
 
+    lastSourceSrt = srt;
     setBusy(true);
     setStatus('Translating… keep this tab open.', '');
     abortController = new AbortController();
@@ -128,7 +210,7 @@
       const res = await fetch('/api/translate', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ apiKey, model: modelSelect.value, srt }),
+        body: JSON.stringify({ apiKey, model, srt }),
         signal: abortController.signal,
       });
 
