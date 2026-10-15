@@ -1,0 +1,15 @@
+{
+  "name": "sub-sinhala-translator",
+  "version": "1.0.0",
+  "description": "Translate SRT subtitle files into natural Sri Lankan Sinhala using the Gemini API.",
+  "main": "server.js",
+  "private": true,
+  "scripts": {
+    "start": "node server.js",
+    "test": "node --test test/*.test.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "license": "UNLICENSED"
+}

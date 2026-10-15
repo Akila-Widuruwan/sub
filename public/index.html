@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="si">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Sinhala Anime Subtitle Translator (Gemini)</title>
+  <link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+  <main class="container">
+    <header>
+      <h1>Sinhala Anime Subtitle Translator</h1>
+      <p class="sub">Translate an SRT episode into natural Sri Lankan Sinhala using the Gemini API.</p>
+    </header>
+
+    <section class="card" id="key-section">
+      <h2><span class="step">1</span> Gemini API key</h2>
+      <label for="api-key">API key</label>
+      <div class="row">
+        <input id="api-key" type="password" autocomplete="off" spellcheck="false" placeholder="Paste your Gemini API key (AIza…)" />
+        <button type="button" id="toggle-key" class="ghost">Show</button>
+      </div>
+      <div class="row between">
+        <label class="check"><input type="checkbox" id="remember-key" /> Remember key in this browser</label>
+        <a class="hint" href="https://aistudio.google.com/app/apikey" target="_blank" rel="noopener">Get a key →</a>
+      </div>
+      <p class="hint small">The key is sent only to the translation request for this session. It is never stored on the server. Only tick "Remember" on a computer you control, since the key is saved in this browser's local storage.</p>
+
+      <label for="model">Model</label>
+      <select id="model"></select>
+    </section>
+
+    <section class="card" id="input-section">
+      <h2><span class="step">2</span> Input SRT</h2>
+      <div class="row between">
+        <input id="srt-file" type="file" accept=".srt,text/plain" />
+        <span id="srt-info" class="hint"></span>
+      </div>
+      <label for="srt-input">…or paste the SRT here</label>
+      <textarea id="srt-input" rows="10" spellcheck="false" placeholder="1&#10;00:00:01,000 --> 00:00:03,000&#10;Hello there."></textarea>
+    </section>
+
+    <section class="card">
+      <h2><span class="step">3</span> Translate</h2>
+      <div class="row">
+        <button type="button" id="translate-btn" class="primary">Translate episode</button>
+        <button type="button" id="cancel-btn" class="ghost" disabled>Cancel</button>
+      </div>
+      <div id="progress-wrap" hidden>
+        <div class="bar"><div id="progress-bar"></div></div>
+        <p id="progress-text" class="hint"></p>
+      </div>
+      <p id="status" class="status" role="status" aria-live="polite"></p>
+    </section>
+
+    <section class="card" id="output-section" hidden>
+      <h2><span class="step">4</span> Result</h2>
+      <div class="row">
+        <button type="button" id="download-btn" class="primary">Download .srt</button>
+        <button type="button" id="copy-btn" class="ghost">Copy</button>
+      </div>
+      <textarea id="srt-output" rows="14" readonly spellcheck="false"></textarea>
+    </section>
+  </main>
+  <script src="/app.js"></script>
+</body>
+</html>
