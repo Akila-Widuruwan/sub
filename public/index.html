@@ -28,6 +28,10 @@
 
       <label for="model">Model</label>
       <select id="model"></select>
+      <div id="custom-model-wrap" hidden>
+        <label for="custom-model">Custom model ID</label>
+        <input id="custom-model" type="text" spellcheck="false" autocomplete="off" placeholder="exact model ID from Google AI Studio, e.g. gemini-3.8-…" />
+      </div>
     </section>
 
     <section class="card" id="input-section">
@@ -60,6 +64,15 @@
         <button type="button" id="copy-btn" class="ghost">Copy</button>
       </div>
       <textarea id="srt-output" rows="14" readonly spellcheck="false"></textarea>
+    </section>
+
+    <section class="card" id="preview-section" hidden>
+      <h2><span class="step">5</span> Preview</h2>
+      <div class="row between">
+        <span id="preview-info" class="hint"></span>
+        <label class="check"><input type="checkbox" id="preview-all" /> Show all subtitles</label>
+      </div>
+      <div id="preview-list" class="preview-list"></div>
     </section>
   </main>
   <script src="/app.js"></script>

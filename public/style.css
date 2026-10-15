@@ -160,3 +160,41 @@ a.hint:hover { text-decoration: underline; }
 .status { min-height: 1.4em; margin: 12px 0 0; }
 .status.error { color: var(--danger); }
 .status.ok { color: var(--ok); }
+
+.preview-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin-top: 14px;
+  max-height: 560px;
+  overflow-y: auto;
+  padding-right: 4px;
+}
+
+.preview-row {
+  background: #0c0e14;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 10px 12px;
+}
+
+.preview-meta {
+  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+  font-size: 0.8rem;
+  color: var(--muted);
+  margin-bottom: 4px;
+}
+
+.preview-orig {
+  color: var(--muted);
+  font-size: 0.92rem;
+  white-space: pre-line;
+}
+
+.preview-si {
+  font-family: var(--sinhala);
+  font-size: 1.05rem;
+  line-height: 1.6;
+  white-space: pre-line;
+  margin-top: 2px;
+}
