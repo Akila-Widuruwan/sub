@@ -40,8 +40,10 @@
 
       <fieldset class="fallback">
         <legend>Automatic fallback models</legend>
-        <p class="hint small">If every key fails on the model above (quota, model not available, server error), try these models before giving up.</p>
+        <p class="hint small">If every key fails on the model above (quota, model not available, server error), try these models before giving up. A key can be out of quota on one model and perfectly fine on another.</p>
         <div id="fallback-models" class="fallback-list"></div>
+        <label class="check patient"><input type="checkbox" id="patient-mode" /> Patient mode — keep retrying an overloaded model (up to ~15 minutes per batch)</label>
+        <p class="hint small">Useful when Gemini answers "the model is experiencing high demand". The app backs off and retries instead of giving up after a few seconds.</p>
       </fieldset>
     </section>
 
@@ -67,6 +69,7 @@
         <div id="failover-log" class="failover-log" hidden></div>
       </div>
       <p id="status" class="status" role="status" aria-live="polite"></p>
+      <div id="error-report" class="error-report" hidden></div>
     </section>
 
     <section class="card" id="output-section" hidden>

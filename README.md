@@ -13,7 +13,12 @@ conversational Sri Lankan Sinhala using the Gemini API. The translation rules
   key and carries on with the same episode. Nothing is lost mid-translation.
 - **Optional model fallback.** Pick a primary model and tick backup models.
   If every key fails on the primary model (404 model not found, quota for that
-  model, …), the run continues on the next model.
+  model, …), the run continues on the next model. Quotas are per model, so a
+  key that is exhausted on one model is still used on the others.
+- **Patient mode.** When Gemini answers "this model is experiencing high
+  demand" (503), patient mode backs off (2s → 10s → 30s → 60s → 2m → 5m) and
+  keeps retrying for up to ~15 minutes per batch instead of giving up after a
+  few seconds.
 - **Key health check.** "Check keys" asks Gemini which of your keys are alive
   and which models each one can call, before you burn a translation on them.
 - Keys can optionally be remembered in this browser only.
@@ -44,12 +49,30 @@ endpoint that fails depends on *why* it failed:
 | --- | --- |
 | `401` / `403` (key rejected) | that key is dropped for the whole run |
 | `404` (model not found) | that model is dropped for every key |
-| `429` (rate limit / quota) | the key is parked for 60s, another key takes over; if no key is left, the run stops with a clear quota error |
-| `5xx` / network error | the key is parked for 3s and retried; meanwhile another key is used |
+| `429` — long wait (hours) | a **per-model daily quota**: only that key+model pair is dropped, the key stays available for other models |
+| `429` — short wait (seconds) | a **per-minute rate limit**: the whole key is parked for exactly as long as Gemini asked, and another key takes over |
+| `5xx` / network error | the endpoint is parked for the `retryDelay` Gemini returned (max 30s) and another key is used meanwhile |
 | Bad model output (invalid JSON, skipped/duplicated lines) | the key is *not* penalised — the batch is simply re-asked (fail over to the next key first) |
 
-A batch gets up to 3 rounds over the pool with exponential backoff, and a
-healthy endpoint stays "sticky" so an episode keeps a consistent voice.
+Gemini says how long to wait (`error.details[].retryDelay`, or "Please retry in
+7h22m58s" in the message), and the app uses that number instead of guessing: a
+7-hour daily-quota block and a 27-second rate limit are handled completely
+differently.
+
+A batch gets 3 rounds over the pool (6 in patient mode) with backoff of
+2s → 10s → 30s → 60s → 2m → 5m, capped by a time budget (90s standard,
+15min patient), and a healthy endpoint stays "sticky" so an episode keeps a
+consistent voice.
+
+### When everything fails
+
+The app no longer hides which option said what. It lists every endpoint it
+tried, the error each one returned, how long each one is blocked for, and a
+hint built from the actual mix of failures — e.g. *"1 option is quota-blocked
+for up to 7h 22m — add a key, or pick a model with more free-tier quota; tick a
+fallback model, or turn on patient mode to ride out the overload."* The
+`POST /api/translate` stream also carries a `waiting` event, so the UI shows
+"Waiting 27s — every key is cooling down" instead of a frozen progress bar.
 
 ## Run
 
@@ -79,9 +102,11 @@ test/app.test.js     Unit + integration tests
 ## API
 
 - `GET /api/models` → the built-in model list.
-- `POST /api/translate` → `{ keys: ["…", "…"] (or "a\nb"), model, fallbackModels?, srt }`,
+- `POST /api/translate` → `{ keys: ["…", "…"] (or "a\nb"), model, fallbackModels?, patient?, srt }`,
   answered as a stream of NDJSON events:
-  `start`, `progress` (with the endpoint in use), `failover`, `result`, `error`.
+  `start`, `progress` (with the endpoint in use), `failover` (with the
+  `retryDelayMs` Gemini asked for), `waiting`, `result`,
+  `error` (`{ message, hint, failures: [{ label, status, message, retryDelayMs }] }`).
   `apiKey` (a single key, string) is still accepted for backwards compatibility.
 - `POST /api/keys/check` → `{ keys: [...] }`, answered with per-key
   `{ ok, status, message, models }` results.

@@ -14,6 +14,10 @@ const {
   maskKey,
   checkKeys,
   buildEndpoints,
+  parseDurationMs,
+  formatDuration,
+  extractRetryDelayMs,
+  extractQuotaModel,
 } = require('../src/gemini');
 const { createServer } = require('../server');
 
@@ -118,7 +122,11 @@ test('buildEndpoints rotates keys before falling back to another model', () => {
 function reply(spec) {
   if (spec instanceof Response) return spec;
   if (spec.status && spec.status !== 200) {
-    return new Response(JSON.stringify({ error: { message: spec.message || 'error' } }), { status: spec.status });
+    const error = { code: spec.status, message: spec.message || 'error', status: 'ERROR' };
+    if (spec.retryDelay) {
+      error.details = [{ '@type': 'type.googleapis.com/google.rpc.RetryInfo', retryDelay: spec.retryDelay }];
+    }
+    return new Response(JSON.stringify({ error }), { status: spec.status });
   }
   const items = spec.items.map((e) => ({ id: e.id, text: (spec.prefix || 'SI:') + e.text }));
   return new Response(
@@ -548,6 +556,235 @@ test('a long episode survives a key dying mid-run', async () => {
     'B:gemini-2.5-flash',
   ]);
   assert.match(progress.at(-1).endpoint.label, /Key 2/);
+});
+
+/* ------------------------------------------------------------------ *
+ * Retry delays and quota scopes
+ * ------------------------------------------------------------------ */
+
+test('parseDurationMs understands seconds, Go durations and plain numbers', () => {
+  assert.equal(parseDurationMs('30'), 30000);
+  assert.equal(parseDurationMs('27s'), 27000);
+  assert.equal(parseDurationMs('1.5m'), 90000);
+  assert.equal(parseDurationMs('7h22m58.998290635s'), 26578998);
+  assert.equal(parseDurationMs('1500ms'), 1500);
+  assert.equal(parseDurationMs('2h'), 7200000);
+  assert.equal(parseDurationMs('nonsense'), null);
+  assert.equal(parseDurationMs(null), null);
+});
+
+test('formatDuration renders waits a human can read', () => {
+  assert.equal(formatDuration(27000), '27s');
+  assert.equal(formatDuration(90000), '1m 30s');
+  assert.equal(formatDuration(26578998), '7h 22m');
+});
+
+test('extractRetryDelayMs reads error.details then the message text', () => {
+  const withDetails = { error: { details: [{ '@type': 'type.googleapis.com/google.rpc.RetryInfo', retryDelay: '27s' }] } };
+  assert.equal(extractRetryDelayMs(withDetails, ''), 27000);
+  const messageOnly = { error: { message: 'Please retry in 7h22m58.998290635s.' } };
+  assert.equal(extractRetryDelayMs(messageOnly, 'Please retry in 7h22m58.998290635s.'), 26578998);
+  assert.equal(extractRetryDelayMs({ error: {} }, 'no delay here'), null);
+});
+
+test('extractQuotaModel finds the model named in a quota error', () => {
+  const msg =
+    "Quota exceeded for metric: generativelanguage.googleapis.com/generate_content_free_tier_requests, limit: 20, model: gemini-3.8-flash";
+  assert.equal(extractQuotaModel(msg), 'gemini-3.8-flash');
+  assert.equal(extractQuotaModel('rate limited'), null);
+});
+
+test('a long per-model quota block only disables that key + model pair', async () => {
+  const entries = parseSrt(THREE_LINES);
+  const quotaMessage =
+    'You exceeded your current quota. * Quota exceeded for metric: generate_content_free_tier_requests, limit: 20, model: gemini-2.5-pro Please retry in 7h22m58.998290635s.';
+  const { fetchImpl, calls } = fakeGemini(({ model }) =>
+    model === 'gemini-2.5-pro'
+      ? { status: 429, retryDelay: '26578.998290635s', message: quotaMessage }
+      : { prefix: 'FLASH:' }
+  );
+  const stats = {};
+  const events = [];
+  const out = await translateEntries(entries, {
+    keys: [KEY_A, KEY_B],
+    model: 'gemini-2.5-pro',
+    fallbackModels: ['gemini-2.5-flash'],
+    fetchImpl,
+    sleep: noSleep,
+    stats,
+    onEvent: (e) => events.push(e),
+  });
+
+  assert.deepEqual(out, ['FLASH:One', 'FLASH:Two', 'FLASH:Three']);
+  // Both keys are out of quota on pro only, so the run continues on flash.
+  assert.deepEqual(calls.map((c) => c.model), ['gemini-2.5-pro', 'gemini-2.5-pro', 'gemini-2.5-flash']);
+  assert.deepEqual(
+    stats.deadEndpoints.map((d) => `${d.keyIndex}:${d.model}`),
+    ['0:gemini-2.5-pro', '1:gemini-2.5-pro'],
+    'only the pro endpoints died — both keys stay alive for other models'
+  );
+  assert.match(stats.deadEndpoints[0].reason, /out of quota on gemini-2.5-pro for 7h 22m/);
+  assert.equal(events[0].retryDelayMs, 26578998);
+  assert.equal(events[0].remaining, 3, 'the flash endpoints are still counted as options');
+});
+
+test('a short rate limit parks the whole key, across models', async () => {
+  const entries = parseSrt(THREE_LINES);
+  const { fetchImpl, calls } = fakeGemini(({ key }) =>
+    key === KEY_A
+      ? { status: 429, retryDelay: '27s', message: 'Too many requests. Please retry in 27s.' }
+      : {}
+  );
+  const stats = {};
+  const out = await translateEntries(entries, {
+    keys: [KEY_A, KEY_B],
+    model: 'gemini-2.5-pro',
+    fallbackModels: ['gemini-2.5-flash'],
+    fetchImpl,
+    batchSize: 1,
+    sleep: noSleep,
+    stats,
+  });
+  assert.deepEqual(out, ['SI:One', 'SI:Two', 'SI:Three']);
+  // Per-minute limits throttle the key, so key A is never used again — not
+  // even on the fallback model.
+  assert.equal(calls.filter((c) => c.key === KEY_A).length, 1);
+  assert.equal(calls.filter((c) => c.key === KEY_B).length, 3);
+  assert.deepEqual(stats.deadEndpoints, [], 'a rate limit is temporary, not a dead endpoint');
+});
+
+test('an overloaded model gives up in standard mode with actionable advice', async () => {
+  const entries = parseSrt(THREE_LINES);
+  const { fetchImpl } = fakeGemini(() => ({
+    status: 503,
+    retryDelay: '27s',
+    message: 'This model is currently experiencing high demand. Spikes in demand are usually temporary.',
+  }));
+  let caught = null;
+  await assert.rejects(
+    translateEntries(entries, { keys: [KEY_A], model: 'gemini-2.5-pro', fetchImpl, sleep: noSleep }),
+    (err) => {
+      caught = err;
+      return err instanceof GeminiError;
+    }
+  );
+  assert.match(caught.message, /Every API key failed with a Gemini service error/);
+  assert.match(caught.hint, /patient mode/);
+  assert.equal(caught.failures.length, 1);
+  assert.equal(caught.failures[0].retryDelayMs, 27000);
+});
+
+/** Fake clock so a batch can "wait" minutes without real time passing. */
+function withFakeClock(run) {
+  const realNow = Date.now;
+  let now = realNow();
+  Date.now = () => now;
+  const sleep = async (ms) => {
+    now += ms;
+  };
+  return Promise.resolve(run(sleep)).finally(() => {
+    Date.now = realNow;
+  });
+}
+
+test('patient mode waits out an overloaded model instead of quitting', async () => {
+  const entries = parseSrt(THREE_LINES);
+  const { fetchImpl, calls } = fakeGemini(({ call }) =>
+    call <= 2
+      ? { status: 503, retryDelay: '27s', message: 'This model is currently experiencing high demand.' }
+      : {}
+  );
+  const events = [];
+  const out = await withFakeClock((sleep) =>
+    translateEntries(entries, {
+      keys: [KEY_A],
+      model: 'gemini-2.5-pro',
+      patient: true,
+      fetchImpl,
+      sleep,
+      onEvent: (e) => events.push(e),
+    })
+  );
+  assert.deepEqual(out, ['SI:One', 'SI:Two', 'SI:Three']);
+  assert.equal(calls.length, 3, 'two failures, then it recovers');
+  const waits = events.filter((e) => e.type === 'waiting');
+  assert.equal(waits.length, 2);
+  assert.equal(waits[0].ms, 27000, 'it waits as long as Gemini asked');
+  assert.match(waits[0].reason, /cooling down|last attempt/);
+});
+
+test('patient mode still gives up inside its time budget', async () => {
+  const entries = parseSrt(THREE_LINES);
+  const { fetchImpl, calls } = fakeGemini(() => ({
+    status: 503,
+    retryDelay: '27s',
+    message: 'This model is currently experiencing high demand.',
+  }));
+  const events = [];
+  await assert.rejects(
+    withFakeClock((sleep) =>
+      translateEntries(entries, {
+        keys: [KEY_A],
+        model: 'gemini-2.5-pro',
+        patient: true,
+        fetchImpl,
+        sleep,
+        onEvent: (e) => events.push(e),
+      })
+    ),
+    (err) => err instanceof GeminiError && /service error/.test(err.message)
+  );
+  const waited = events.filter((e) => e.type === 'waiting').reduce((sum, e) => sum + e.ms, 0);
+  assert.ok(waited <= 15 * 60 * 1000, `waited ${waited}ms, budget is 15min`);
+  assert.ok(calls.length <= 6, `gave up after ${calls.length} attempts`);
+});
+
+test('server reports every failure and a hint when the pool is exhausted', async () => {
+  const mock = http.createServer((req, res) => {
+    let data = '';
+    req.on('data', (c) => (data += c));
+    req.on('end', () => {
+      const key = req.headers['x-goog-api-key'];
+      res.setHeader('Content-Type', 'application/json');
+      const error = { code: key === KEY_B ? 429 : 503, status: key === KEY_B ? 'RESOURCE_EXHAUSTED' : 'UNAVAILABLE' };
+      if (key === KEY_B) {
+        error.message =
+          'You exceeded your current quota. * Quota exceeded for metric: generate_content_free_tier_requests, limit: 20, model: gemini-2.5-pro Please retry in 7h22m58.998290635s.';
+        error.details = [{ '@type': 'type.googleapis.com/google.rpc.RetryInfo', retryDelay: '26578.998290635s' }];
+      } else {
+        error.message = 'This model is currently experiencing high demand.';
+        error.details = [{ '@type': 'type.googleapis.com/google.rpc.RetryInfo', retryDelay: '27s' }];
+      }
+      res.writeHead(error.code);
+      res.end(JSON.stringify({ error }));
+    });
+  });
+  await new Promise((r) => mock.listen(0, '127.0.0.1', r));
+  process.env.GEMINI_BASE_URL = `http://127.0.0.1:${mock.address().port}`;
+
+  const app = createServer();
+  await new Promise((r) => app.listen(0, '127.0.0.1', r));
+  const base = `http://127.0.0.1:${app.address().port}`;
+
+  try {
+    const res = await fetch(`${base}/api/translate`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ keys: [KEY_A, KEY_B], model: 'gemini-2.5-pro', srt: THREE_LINES }),
+    });
+    assert.equal(res.status, 200);
+    const lines = (await res.text()).trim().split('\n').map((l) => JSON.parse(l));
+    const err = lines.find((l) => l.type === 'error');
+    assert.ok(err, 'expected an error event');
+    assert.equal(err.failures.length, 2, 'one line per endpoint, not truncated to three');
+    assert.equal(err.failures.find((f) => f.label.startsWith('Key 2')).retryDelayMs, 26578998);
+    assert.ok(err.hint && err.hint.length > 0);
+    assert.match(err.message, /Every API key failed/);
+  } finally {
+    app.close();
+    mock.close();
+    delete process.env.GEMINI_BASE_URL;
+  }
 });
 
 test('server checks keys over /api/keys/check', async () => {
