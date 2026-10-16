@@ -10,21 +10,26 @@
   <main class="container">
     <header>
       <h1>Sinhala Anime Subtitle Translator</h1>
-      <p class="sub">Translate an SRT episode into natural Sri Lankan Sinhala using the Gemini API.</p>
+      <p class="sub">Translate an SRT episode into natural Sri Lankan Sinhala using the Gemini API — with automatic failover across all your API keys.</p>
     </header>
 
     <section class="card" id="key-section">
-      <h2><span class="step">1</span> Gemini API key</h2>
-      <label for="api-key">API key</label>
-      <div class="row">
-        <input id="api-key" type="password" autocomplete="off" spellcheck="false" placeholder="Paste your Gemini API key (AIza…)" />
-        <button type="button" id="toggle-key" class="ghost">Show</button>
-      </div>
+      <h2><span class="step">1</span> Gemini API keys</h2>
+      <label for="api-keys">API keys — one per line</label>
+      <textarea id="api-keys" rows="3" spellcheck="false" autocomplete="off" class="masked" placeholder="AIza…&#10;AIza…&#10;AIza…"></textarea>
       <div class="row between">
-        <label class="check"><input type="checkbox" id="remember-key" /> Remember key in this browser</label>
+        <span id="key-info" class="hint"></span>
+        <div class="row">
+          <button type="button" id="toggle-key" class="ghost">Show</button>
+          <button type="button" id="check-keys-btn" class="ghost">Check keys</button>
+        </div>
+      </div>
+      <div id="key-status-list" class="key-status-list" hidden></div>
+      <div class="row between">
+        <label class="check"><input type="checkbox" id="remember-key" /> Remember keys in this browser</label>
         <a class="hint" href="https://aistudio.google.com/app/apikey" target="_blank" rel="noopener">Get a key →</a>
       </div>
-      <p class="hint small">The key is sent only to the translation request for this session. It is never stored on the server. Only tick "Remember" on a computer you control, since the key is saved in this browser's local storage.</p>
+      <p class="hint small">Add as many keys as you like. If a key is rejected, rate limited or out of quota, the app automatically switches to the next one mid-translation and keeps going. Keys are sent only to the translation request for this session and are never written to disk. Only tick "Remember" on a computer you control, since they are saved in this browser's local storage.</p>
 
       <label for="model">Model</label>
       <select id="model"></select>
@@ -32,6 +37,12 @@
         <label for="custom-model">Custom model ID</label>
         <input id="custom-model" type="text" spellcheck="false" autocomplete="off" placeholder="exact model ID from Google AI Studio, e.g. gemini-3.8-…" />
       </div>
+
+      <fieldset class="fallback">
+        <legend>Automatic fallback models</legend>
+        <p class="hint small">If every key fails on the model above (quota, model not available, server error), try these models before giving up.</p>
+        <div id="fallback-models" class="fallback-list"></div>
+      </fieldset>
     </section>
 
     <section class="card" id="input-section">
@@ -53,6 +64,7 @@
       <div id="progress-wrap" hidden>
         <div class="bar"><div id="progress-bar"></div></div>
         <p id="progress-text" class="hint"></p>
+        <div id="failover-log" class="failover-log" hidden></div>
       </div>
       <p id="status" class="status" role="status" aria-live="polite"></p>
     </section>

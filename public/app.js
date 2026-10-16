@@ -2,12 +2,17 @@
   'use strict';
 
   const $ = (id) => document.getElementById(id);
-  const KEY_STORAGE = 'gemini_api_key';
+  const KEYS_STORAGE = 'gemini_api_keys';
+  const OLD_KEY_STORAGE = 'gemini_api_key';
 
-  const apiKeyInput = $('api-key');
+  const apiKeysInput = $('api-keys');
   const rememberKey = $('remember-key');
   const toggleKeyBtn = $('toggle-key');
+  const checkKeysBtn = $('check-keys-btn');
+  const keyInfo = $('key-info');
+  const keyStatusList = $('key-status-list');
   const modelSelect = $('model');
+  const fallbackWrap = $('fallback-models');
   const srtFile = $('srt-file');
   const srtInput = $('srt-input');
   const srtInfo = $('srt-info');
@@ -16,6 +21,7 @@
   const progressWrap = $('progress-wrap');
   const progressBar = $('progress-bar');
   const progressText = $('progress-text');
+  const failoverLog = $('failover-log');
   const statusEl = $('status');
   const outputSection = $('output-section');
   const srtOutput = $('srt-output');
@@ -35,27 +41,120 @@
   let resultSrt = '';
   let sourceName = 'episode';
 
-  // ---- API key (optional remember) ----
-  const savedKey = localStorage.getItem(KEY_STORAGE);
-  if (savedKey) {
-    apiKeyInput.value = savedKey;
-    rememberKey.checked = true;
+  // ---- API keys (optional remember) ----
+  function getKeys() {
+    return apiKeysInput.value
+      .split('\n')
+      .map((k) => k.trim())
+      .filter(Boolean);
   }
+
+  function setKeys(list) {
+    apiKeysInput.value = list.join('\n');
+    updateKeyInfo();
+  }
+
+  function updateKeyInfo() {
+    const n = getKeys().length;
+    keyInfo.textContent = n === 0
+      ? ''
+      : n === 1
+        ? '1 key — no backup if it fails'
+        : `${n} keys — automatic failover enabled`;
+  }
+
+  function loadStoredKeys() {
+    let stored = null;
+    try {
+      stored = JSON.parse(localStorage.getItem(KEYS_STORAGE) || 'null');
+    } catch (_) {
+      stored = null;
+    }
+    if (!Array.isArray(stored) || !stored.length) {
+      const legacy = localStorage.getItem(OLD_KEY_STORAGE); // migrate the old single key
+      stored = legacy ? [legacy] : [];
+    }
+    if (stored.length) {
+      setKeys(stored);
+      rememberKey.checked = true;
+    }
+  }
+
   rememberKey.addEventListener('change', () => {
-    if (rememberKey.checked && apiKeyInput.value.trim()) {
-      localStorage.setItem(KEY_STORAGE, apiKeyInput.value.trim());
+    if (rememberKey.checked && getKeys().length) {
+      localStorage.setItem(KEYS_STORAGE, JSON.stringify(getKeys()));
     } else if (!rememberKey.checked) {
-      localStorage.removeItem(KEY_STORAGE);
+      localStorage.removeItem(KEYS_STORAGE);
+      localStorage.removeItem(OLD_KEY_STORAGE);
     }
   });
-  apiKeyInput.addEventListener('input', () => {
-    if (rememberKey.checked) localStorage.setItem(KEY_STORAGE, apiKeyInput.value.trim());
+  apiKeysInput.addEventListener('input', () => {
+    updateKeyInfo();
+    if (rememberKey.checked) localStorage.setItem(KEYS_STORAGE, JSON.stringify(getKeys()));
   });
   toggleKeyBtn.addEventListener('click', () => {
-    const show = apiKeyInput.type === 'password';
-    apiKeyInput.type = show ? 'text' : 'password';
+    const show = apiKeysInput.classList.contains('masked');
+    apiKeysInput.classList.toggle('masked', !show);
     toggleKeyBtn.textContent = show ? 'Hide' : 'Show';
   });
+
+  // ---- Key health check ----
+  function renderKeyStatus(results) {
+    keyStatusList.innerHTML = '';
+    keyStatusList.hidden = !results.length;
+    for (const r of results) {
+      const row = document.createElement('div');
+      row.className = 'key-row ' + (r.ok ? 'ok' : 'bad');
+
+      const name = document.createElement('span');
+      name.className = 'key-name';
+      name.textContent = `${r.label} · ${r.masked}`;
+
+      const state = document.createElement('span');
+      state.className = 'key-state';
+      state.textContent = r.ok ? '✓ working' : `✗ ${r.status ? 'error ' + r.status : 'unreachable'}`;
+
+      const detail = document.createElement('span');
+      detail.className = 'key-detail';
+      detail.textContent = r.ok
+        ? r.models.length
+          ? `${r.models.length} models available (e.g. ${r.models.slice(0, 3).join(', ')})`
+          : 'Key accepted.'
+        : r.message;
+
+      row.append(name, state, detail);
+      keyStatusList.appendChild(row);
+    }
+  }
+
+  async function checkKeys() {
+    const keys = getKeys();
+    if (!keys.length) return setStatus('Add at least one API key first.', 'error');
+    checkKeysBtn.disabled = true;
+    setStatus('Checking keys…', '');
+    try {
+      const res = await fetch('/api/keys/check', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ keys }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || `Request failed (${res.status}).`);
+      renderKeyStatus(data.results);
+      const ok = data.results.filter((r) => r.ok).length;
+      setStatus(
+        `${ok} of ${data.results.length} key${data.results.length === 1 ? '' : 's'} working.` +
+          (ok && ok < data.results.length ? ' The working ones will be used first.' : ''),
+        ok ? 'ok' : 'error'
+      );
+    } catch (err) {
+      setStatus(err.message || 'Could not check the keys.', 'error');
+    } finally {
+      checkKeysBtn.disabled = false;
+    }
+  }
+
+  checkKeysBtn.addEventListener('click', checkKeys);
 
   // ---- Models ----
   async function loadModels() {
@@ -63,14 +162,26 @@
       const res = await fetch('/api/models');
       const data = await res.json();
       modelSelect.innerHTML = '';
+      fallbackWrap.innerHTML = '';
       for (const m of data.models) {
         const opt = document.createElement('option');
         opt.value = m.id;
         opt.textContent = m.label;
         modelSelect.appendChild(opt);
+
+        const label = document.createElement('label');
+        label.className = 'check';
+        const box = document.createElement('input');
+        box.type = 'checkbox';
+        box.className = 'fallback-box';
+        box.value = m.id;
+        label.appendChild(box);
+        label.appendChild(document.createTextNode(' ' + m.label));
+        fallbackWrap.appendChild(label);
       }
     } catch (_) {
       modelSelect.innerHTML = '<option value="gemini-2.5-flash">Gemini 2.5 Flash</option>';
+      fallbackWrap.innerHTML = '';
     }
     const other = document.createElement('option');
     other.value = CUSTOM;
@@ -87,6 +198,14 @@
   function selectedModel() {
     if (modelSelect.value === CUSTOM) return customModelInput.value.trim();
     return modelSelect.value;
+  }
+
+  function selectedFallbacks() {
+    const model = selectedModel();
+    return [...fallbackWrap.querySelectorAll('.fallback-box')]
+      .filter((b) => b.checked)
+      .map((b) => b.value)
+      .filter((m) => m !== model);
   }
 
   // ---- SRT input ----
@@ -119,10 +238,13 @@
   function setBusy(busy) {
     translateBtn.disabled = busy;
     cancelBtn.disabled = !busy;
+    checkKeysBtn.disabled = busy;
     progressWrap.hidden = !busy;
     if (busy) {
       progressBar.style.width = '0%';
       progressText.textContent = 'Starting…';
+      failoverLog.innerHTML = '';
+      failoverLog.hidden = true;
     }
   }
 
@@ -132,6 +254,32 @@
     outputSection.hidden = false;
     renderPreview();
     outputSection.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  }
+
+  function endpointLabel(endpoint) {
+    if (!endpoint) return '';
+    const key = endpoint.keyIndex === null || endpoint.keyIndex === undefined
+      ? ''
+      : `Key ${endpoint.keyIndex + 1}`;
+    return [key, endpoint.model].filter(Boolean).join(' · ');
+  }
+
+  function logFailover(evt) {
+    failoverLog.hidden = false;
+    const row = document.createElement('div');
+    row.className = 'failover-row';
+    const where = document.createElement('span');
+    where.className = 'failover-where';
+    where.textContent = `${endpointLabel(evt.endpoint)} failed`;
+    const why = document.createElement('span');
+    why.className = 'failover-why';
+    why.textContent = evt.remaining > 0
+      ? `${evt.reason} — switching (${evt.remaining} option${evt.remaining === 1 ? '' : 's'} left).`
+      : `${evt.reason} — no options left, retrying.`;
+    row.append(where, why);
+    failoverLog.appendChild(row);
+    while (failoverLog.childElementCount > 6) failoverLog.removeChild(failoverLog.firstChild);
+    failoverLog.scrollTop = failoverLog.scrollHeight;
   }
 
   // ---- Preview (client-side SRT parse, original vs translated) ----
@@ -190,16 +338,16 @@
 
   // ---- Translate (streams NDJSON progress from the server) ----
   async function translate() {
-    const apiKey = apiKeyInput.value.trim();
+    const keys = getKeys();
     const srt = srtInput.value;
 
-    if (!apiKey) return setStatus('Please enter your Gemini API key.', 'error');
+    if (!keys.length) return setStatus('Please enter at least one Gemini API key.', 'error');
     if (!srt.trim()) return setStatus('Please upload or paste an SRT file.', 'error');
     if (countEntries(srt) === 0) return setStatus('This does not look like an SRT file (no "-->" timing lines found).', 'error');
     const model = selectedModel();
     if (!model) return setStatus('Please enter the custom model ID.', 'error');
 
-    if (rememberKey.checked) localStorage.setItem(KEY_STORAGE, apiKey);
+    if (rememberKey.checked) localStorage.setItem(KEYS_STORAGE, JSON.stringify(keys));
 
     lastSourceSrt = srt;
     setBusy(true);
@@ -210,7 +358,7 @@
       const res = await fetch('/api/translate', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ apiKey, model, srt }),
+        body: JSON.stringify({ keys, model, fallbackModels: selectedFallbacks(), srt }),
         signal: abortController.signal,
       });
 
@@ -232,12 +380,23 @@
           progressText.textContent = `0 / ${evt.total} subtitles`;
         } else if (evt.type === 'progress') {
           const pct = Math.round((evt.done / evt.total) * 100);
+          const who = endpointLabel(evt.endpoint);
           progressBar.style.width = pct + '%';
-          progressText.textContent = `${evt.done} / ${evt.total} subtitles (${pct}%)`;
+          progressText.textContent = `${evt.done} / ${evt.total} subtitles (${pct}%)` + (who ? ` · ${who}` : '');
+        } else if (evt.type === 'failover') {
+          logFailover(evt);
         } else if (evt.type === 'result') {
           finished = true;
           showResult(evt.srt);
-          setStatus(`Done — ${evt.count} subtitles translated.`, 'ok');
+          const used = Array.isArray(evt.used) ? evt.used : [];
+          const models = [...new Set(used.map((u) => u.model).filter(Boolean))];
+          const keyCount = new Set(used.map((u) => u.keyIndex)).size;
+          let extra = '';
+          if (used.length) {
+            extra = ` via ${models.join(', ')}`;
+            if (keyCount > 1) extra += ` (${keyCount} keys used)`;
+          }
+          setStatus(`Done — ${evt.count} subtitles translated${extra}.`, 'ok');
         } else if (evt.type === 'error') {
           finished = true;
           setStatus(evt.message, 'error');
@@ -292,5 +451,6 @@
     }
   });
 
+  loadStoredKeys();
   loadModels();
 })();
