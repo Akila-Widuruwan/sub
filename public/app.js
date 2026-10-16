@@ -22,7 +22,9 @@
   const progressBar = $('progress-bar');
   const progressText = $('progress-text');
   const failoverLog = $('failover-log');
+  const patientMode = $('patient-mode');
   const statusEl = $('status');
+  const errorReport = $('error-report');
   const outputSection = $('output-section');
   const srtOutput = $('srt-output');
   const downloadBtn = $('download-btn');
@@ -245,6 +247,8 @@
       progressText.textContent = 'Starting…';
       failoverLog.innerHTML = '';
       failoverLog.hidden = true;
+      errorReport.innerHTML = '';
+      errorReport.hidden = true;
     }
   }
 
@@ -273,13 +277,55 @@
     where.textContent = `${endpointLabel(evt.endpoint)} failed`;
     const why = document.createElement('span');
     why.className = 'failover-why';
+    const wait = evt.retryDelayMs ? ` (Gemini says retry in ${formatWait(evt.retryDelayMs)})` : '';
     why.textContent = evt.remaining > 0
-      ? `${evt.reason} — switching (${evt.remaining} option${evt.remaining === 1 ? '' : 's'} left).`
-      : `${evt.reason} — no options left, retrying.`;
+      ? `${evt.reason}${wait} — switching, ${evt.remaining} option${evt.remaining === 1 ? '' : 's'} left.`
+      : `${evt.reason}${wait} — no options left, retrying.`;
     row.append(where, why);
     failoverLog.appendChild(row);
     while (failoverLog.childElementCount > 6) failoverLog.removeChild(failoverLog.firstChild);
     failoverLog.scrollTop = failoverLog.scrollHeight;
+  }
+
+  function formatWait(ms) {
+    const sec = Math.max(0, Math.round(ms / 1000));
+    if (sec < 60) return `${sec}s`;
+    const min = Math.floor(sec / 60);
+    if (min < 60) return `${min}m ${sec % 60}s`;
+    const h = Math.floor(min / 60);
+    return `${h}h ${min % 60}m`;
+  }
+
+  function renderErrorReport(evt) {
+    const failures = Array.isArray(evt.failures) ? evt.failures : [];
+    errorReport.innerHTML = '';
+    errorReport.hidden = !failures.length;
+    if (!failures.length) return;
+
+    const title = document.createElement('p');
+    title.className = 'error-report-title';
+    title.textContent = `What each option said (${failures.length}):`;
+    errorReport.appendChild(title);
+
+    for (const f of failures) {
+      const row = document.createElement('div');
+      row.className = 'error-row';
+      const who = document.createElement('span');
+      who.className = 'error-who';
+      who.textContent = f.label || 'option';
+      const what = document.createElement('span');
+      what.className = 'error-what';
+      what.textContent = f.message + (f.retryDelayMs ? ` (retry in ${formatWait(f.retryDelayMs)})` : '');
+      row.append(who, what);
+      errorReport.appendChild(row);
+    }
+
+    if (evt.hint) {
+      const hint = document.createElement('p');
+      hint.className = 'error-hint';
+      hint.textContent = evt.hint;
+      errorReport.appendChild(hint);
+    }
   }
 
   // ---- Preview (client-side SRT parse, original vs translated) ----
@@ -358,7 +404,7 @@
       const res = await fetch('/api/translate', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ keys, model, fallbackModels: selectedFallbacks(), srt }),
+        body: JSON.stringify({ keys, model, fallbackModels: selectedFallbacks(), patient: patientMode.checked, srt }),
         signal: abortController.signal,
       });
 
@@ -385,8 +431,11 @@
           progressText.textContent = `${evt.done} / ${evt.total} subtitles (${pct}%)` + (who ? ` · ${who}` : '');
         } else if (evt.type === 'failover') {
           logFailover(evt);
+        } else if (evt.type === 'waiting') {
+          progressText.textContent = `Waiting ${Math.round(evt.ms / 1000)}s — ${evt.reason}. Still holding your place…`;
         } else if (evt.type === 'result') {
           finished = true;
+          errorReport.hidden = true;
           showResult(evt.srt);
           const used = Array.isArray(evt.used) ? evt.used : [];
           const models = [...new Set(used.map((u) => u.model).filter(Boolean))];
@@ -400,6 +449,7 @@
         } else if (evt.type === 'error') {
           finished = true;
           setStatus(evt.message, 'error');
+          renderErrorReport(evt);
         }
       };
 

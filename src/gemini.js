@@ -14,12 +14,26 @@ const MODELS = [
 
 const BATCH_SIZE = 40; // subtitle entries per request
 const CONTEXT_SIZE = 8; // previously translated entries shown as context
-const MAX_ROUNDS = 3; // rounds over the whole endpoint list, per batch
 const MAX_KEYS = 20; // hard cap so a paste accident can't spin forever
-const QUOTA_COOLDOWN_MS = 60 * 1000; // key hit a rate/quota limit: park it for a while
-const TRANSIENT_COOLDOWN_MS = 3 * 1000; // network / 5xx: try another key first, come back soon
-const RECOVERY_WAIT_MS = 5 * 1000; // only wait out short outages; a quota block ends the run
 const KEY_CHECK_TIMEOUT_MS = 20 * 1000;
+
+// --- failover tuning -----------------------------------------------------
+const MAX_ROUNDS = 3; // rounds over the whole endpoint list, per batch
+const PATIENT_MAX_ROUNDS = 6; // "patient mode": sit through a temporary model outage
+const BACKOFF_MS = [2000, 10000, 30000, 60000, 120000, 300000];
+const QUOTA_COOLDOWN_MS = 60 * 1000; // fallback when Gemini doesn't say how long to wait
+const TRANSIENT_COOLDOWN_MS = 5 * 1000; // network / 5xx: try another key first, come back soon
+const TRANSIENT_MAX_COOLDOWN_MS = 30 * 1000; // never park a healthy key longer than this for a blip
+/**
+ * A 429 shorter than this is a per-minute rate limit (whole key is throttled);
+ * anything longer is a per-model daily quota, which only blocks that
+ * key+model pair.
+ */
+const QUOTA_BLOCK_THRESHOLD_MS = 2 * 60 * 1000;
+const RECOVERY_WAIT_MS = 30 * 1000; // standard mode: wait out short outages (one 27s spike) but not quotas
+const PATIENT_RECOVERY_WAIT_MS = 10 * 60 * 1000; // patient mode: wait out long ones too
+const BATCH_BUDGET_MS = 90 * 1000; // standard mode: give up on a batch after this
+const PATIENT_BATCH_BUDGET_MS = 15 * 60 * 1000; // patient mode
 
 const RESPONSE_SCHEMA = {
   type: 'ARRAY',
@@ -47,13 +61,84 @@ class GeminiError extends Error {
    * kind: 'http' (a status came back) | 'network' (request never landed) |
    *       'output' (Gemini answered but the batch was unusable)
    */
-  constructor(message, { status, retryable = false, kind = 'http' } = {}) {
+  constructor(message, { status, retryable = false, kind = 'http', retryDelayMs = null, quotaModel = null } = {}) {
     super(message);
     this.name = 'GeminiError';
     this.status = status;
     this.retryable = retryable;
     this.kind = kind;
+    this.retryDelayMs = retryDelayMs; // how long Gemini asked us to wait
+    this.quotaModel = quotaModel; // model named in a quota error, if any
   }
+}
+
+/* ------------------------------------------------------------------ *
+ * Durations: Gemini hands back Go-style delays such as 27s,
+ * 7h22m58.998290635s or 1.5m, both in error.details[].retryDelay and
+ * inside the human-readable message ("Please retry in 7h22m…").
+ * ------------------------------------------------------------------ */
+
+const DURATION_UNITS = { ns: 1e-6, us: 1e-3, 'µs': 1e-3, ms: 1, s: 1000, m: 60 * 1000, h: 60 * 60 * 1000 };
+
+/** Parses "30", "27s", "1.5m", "7h22m58.998290635s" into milliseconds. */
+function parseDurationMs(text) {
+  if (typeof text !== 'string') return null;
+  const raw = text.trim().toLowerCase();
+  if (!raw) return null;
+  const single = /^(\d+(?:\.\d+)?)\s*(ns|us|µs|ms|s|m|h)?$/.exec(raw);
+  if (single) return Math.round(Number(single[1]) * DURATION_UNITS[single[2] || 's']);
+  const go = /^(?:(\d+(?:\.\d+)?)h)?(?:(\d+(?:\.\d+)?)m)?(?:(\d+(?:\.\d+)?)s)?$/.exec(raw);
+  if (go && (go[1] || go[2] || go[3])) {
+    return Math.round(
+      Number(go[1] || 0) * 3600000 + Number(go[2] || 0) * 60000 + Number(go[3] || 0) * 1000
+    );
+  }
+  return null;
+}
+
+function formatDuration(ms) {
+  const total = Math.max(0, Math.round(Number(ms) / 1000));
+  const h = Math.floor(total / 3600);
+  const m = Math.floor((total % 3600) / 60);
+  const sec = total % 60;
+  if (h) return m ? `${h}h ${m}m` : `${h}h`;
+  if (m) return sec ? `${m}m ${sec}s` : `${m}m`;
+  return `${sec}s`;
+}
+
+/** Pulls the retry delay out of the error payload, then out of the message. */
+function extractRetryDelayMs(data, message) {
+  const details = data?.error?.details;
+  if (Array.isArray(details)) {
+    for (const d of details) {
+      const ms = parseDurationMs(d && d.retryDelay);
+      if (ms && ms > 0) return ms;
+    }
+  }
+  for (const candidate of [data?.error?.retryDelay, data?.error?.retryAfter]) {
+    const ms = parseDurationMs(candidate);
+    if (ms && ms > 0) return ms;
+  }
+  // Last char must be a unit/digit so a trailing full stop isn't captured.
+  const patterns = [
+    /retry(?:ing)? in ([0-9][0-9hms.]*[0-9hms])/i,
+    /retry after ([0-9][0-9hms.]*[0-9hms])/i,
+    /try again in ([0-9][0-9hms.]*[0-9hms])/i,
+  ];
+  for (const re of patterns) {
+    const m = re.exec(message || '');
+    if (m) {
+      const ms = parseDurationMs(m[1].replace(/[.,;]+$/, ''));
+      if (ms && ms > 0) return ms;
+    }
+  }
+  return null;
+}
+
+/** "…Quota exceeded for …, model: gemini-3.8-flash" → "gemini-3.8-flash". */
+function extractQuotaModel(message) {
+  const m = /model[:=]\s*['"]?([a-z0-9][a-z0-9.\-_/]{1,63})/i.exec(message || '');
+  return m ? m[1] : null;
 }
 
 let systemPromptCache = null;
@@ -170,7 +255,14 @@ async function callGemini({ apiKey, model, systemPrompt, userPrompt, baseUrl, fe
   if (!res.ok) {
     const detail = data?.error?.message || '';
     const retryable = res.status === 429 || res.status >= 500;
-    throw new GeminiError(friendlyHttpError(res.status, detail), { status: res.status, retryable });
+    const retryDelayMs = retryable ? extractRetryDelayMs(data, detail) : null;
+    const quotaModel = res.status === 429 ? extractQuotaModel(detail) : null;
+    throw new GeminiError(friendlyHttpError(res.status, detail), {
+      status: res.status,
+      retryable,
+      retryDelayMs,
+      quotaModel,
+    });
   }
 
   if (data?.promptFeedback?.blockReason) {
@@ -313,7 +405,18 @@ class EndpointPool {
       return 'fatal';
     }
     if (status === 429) {
-      const until = Date.now() + QUOTA_COOLDOWN_MS;
+      const delay = Number(err.retryDelayMs) > 0 ? Number(err.retryDelayMs) : null;
+      // A long wait is a per-model daily quota ("retry in 7h22m" for
+      // gemini-3.8-flash): the key itself is fine on other models, so only
+      // this key+model pair gets dropped.
+      if (delay && delay > QUOTA_BLOCK_THRESHOLD_MS) {
+        endpoint.disabled = true;
+        endpoint.disabledReason = `out of quota on ${err.quotaModel || endpoint.model} for ${formatDuration(delay)}`;
+        return 'fatal';
+      }
+      // Short waits are per-minute rate limits: they throttle the whole key.
+      const park = Math.min(Math.max(delay || QUOTA_COOLDOWN_MS, 1000), QUOTA_BLOCK_THRESHOLD_MS);
+      const until = Date.now() + park;
       for (const ep of this.endpoints) {
         if (ep.key === endpoint.key && ep.cooldownUntil < until) ep.cooldownUntil = until;
       }
@@ -323,7 +426,9 @@ class EndpointPool {
     // the key is fine, so let the next round simply ask again.
     if (kind === 'output') return 'retryable';
     if (kind === 'network' || (status !== undefined && status >= 500)) {
-      endpoint.cooldownUntil = Math.max(endpoint.cooldownUntil, Date.now() + TRANSIENT_COOLDOWN_MS);
+      const delay = Number(err.retryDelayMs) > 0 ? Number(err.retryDelayMs) : TRANSIENT_COOLDOWN_MS;
+      const park = Math.min(Math.max(delay, 1000), TRANSIENT_MAX_COOLDOWN_MS);
+      endpoint.cooldownUntil = Math.max(endpoint.cooldownUntil, Date.now() + park);
       return 'retryable';
     }
     endpoint.disabled = true;
@@ -347,6 +452,16 @@ class EndpointPool {
   }
 }
 
+function backoffFor(round) {
+  return BACKOFF_MS[Math.min(Math.max(round, 1), BACKOFF_MS.length) - 1];
+}
+
+async function waitBefore(sleep, onEvent, ms, reason) {
+  if (ms <= 0) return;
+  if (onEvent) onEvent({ type: 'waiting', ms, reason });
+  await sleep(ms);
+}
+
 function summarizeFailures(failures) {
   const seen = new Map();
   for (const f of failures) if (!seen.has(f.label)) seen.set(f.label, f.message);
@@ -355,27 +470,83 @@ function summarizeFailures(failures) {
   return lines.length > 3 ? `${shown} | (+${lines.length - 3} more)` : shown;
 }
 
-function buildExhaustedError(failures, pool) {
-  if (!failures.length) {
+function uniqueFailures(failures) {
+  const seen = new Map();
+  for (const f of failures) if (!seen.has(f.label)) seen.set(f.label, f);
+  return [...seen.values()];
+}
+
+/**
+ * Turns the collected per-endpoint failures into one message the user can act
+ * on, plus a structured list the UI renders line by line.
+ */
+function buildExhaustedError(failures, pool, { patient = false } = {}) {
+  const all = uniqueFailures(failures);
+
+  if (!all.length) {
     const dead = pool.endpoints
       .filter((ep) => ep.disabled)
-      .slice(0, 3)
-      .map((ep) => `${ep.label} (${ep.disabledReason || 'unavailable'})`);
-    return new GeminiError(`No usable API key left. ${dead.join('; ')}`);
-  }
-  const summary = summarizeFailures(failures);
-  const statuses = new Set(failures.map((f) => f.status));
-  if (statuses.size === 1 && (statuses.has(401) || statuses.has(403))) {
-    return new GeminiError(
-      `Every API key was rejected (${[...statuses][0]}). Check that the keys are valid and have Gemini API access. ${summary}`
+      .slice(0, 8)
+      .map((ep) => ({ label: ep.label, status: null, message: ep.disabledReason || 'unavailable', retryDelayMs: null }));
+    const err = new GeminiError(
+      `No usable API key left. ${dead.map((d) => `${d.label} (${d.message})`).join('; ')}`
     );
+    err.failures = dead;
+    err.hint = 'Add another key, or pick a model the remaining keys can still call.';
+    return err;
   }
-  if (statuses.size === 1 && statuses.has(429)) {
-    return new GeminiError(
-      `Every API key is out of quota or rate limited (429). Wait a while, or add another key. ${summary}`
-    );
+
+  const list = all.map((f) => ({
+    label: f.label,
+    status: f.status === undefined ? null : f.status,
+    message: f.message,
+    retryDelayMs: f.retryDelayMs || null,
+  }));
+  const statuses = new Set(all.map((f) => f.status));
+  const only = (...codes) => statuses.size === 1 && codes.includes([...statuses][0]);
+  const longestWait = Math.max(0, ...list.map((f) => f.retryDelayMs || 0));
+
+  let message;
+  let hint;
+  if (only(401, 403)) {
+    message = `Every API key was rejected (${[...statuses][0]}). Check that the keys are valid and have Gemini API access.`;
+    hint = 'Use "Check keys" in step 1 to see which ones Google accepts.';
+  } else if (only(429)) {
+    message = 'Every API key is out of quota or rate limited (429).';
+    hint =
+      longestWait > 60000
+        ? `The longest block is ${formatDuration(longestWait)}. Add another key, or pick a model with a bigger free-tier quota — a key can be out of quota on one model and fine on another.`
+        : 'Wait a minute and try again, or add another key.';
+  } else if ([...statuses].every((st) => st === undefined || st >= 500)) {
+    message = 'Every API key failed with a Gemini service error.';
+    hint = patient
+      ? `The model is overloaded on Google's side even in patient mode. Retry later, or pick a different model.`
+      : 'The model is overloaded. Retry later, tick a fallback model, or turn on patient mode to keep retrying.';
+  } else {
+    message = 'Every API key failed on this batch.';
+    const blocked = list.filter((f) => f.retryDelayMs && f.retryDelayMs > 60000);
+    const overloaded = list.filter((f) => f.status === null || f.status >= 500);
+    const advice = [];
+    if (blocked.length) {
+      const longestBlock = Math.max(...blocked.map((f) => f.retryDelayMs));
+      advice.push(
+        `${blocked.length} option${blocked.length === 1 ? ' is' : 's are'} quota-blocked for up to ${formatDuration(longestBlock)} — add a key, or pick a model with more free-tier quota`
+      );
+    }
+    if (overloaded.length) {
+      advice.push(
+        patient
+          ? 'the model is still overloaded on Google\'s side — retry later or pick a different model'
+          : 'tick a fallback model, or turn on patient mode to ride out the overload'
+      );
+    }
+    hint = advice.length ? `${advice.join('; ')}.` : 'Add more keys, or pick a different model.';
   }
-  return new GeminiError(`Every API key failed on this batch. ${summary}`);
+
+  const err = new GeminiError(`${message} ${hint}`);
+  err.failures = list;
+  err.hint = hint;
+  return err;
 }
 
 /**
@@ -383,19 +554,25 @@ function buildExhaustedError(failures, pool) {
  * error. Returns the validated map plus the endpoint that answered.
  */
 async function translateBatchWithFailover(pool, options) {
-  const { systemPrompt, userPrompt, expectedIds, baseUrl, fetchImpl, sleep, onEvent, batchStart } = options;
+  const { systemPrompt, userPrompt, expectedIds, baseUrl, fetchImpl, sleep, onEvent, batchStart, patient = false } = options;
   const failures = [];
+  const maxRounds = patient ? PATIENT_MAX_ROUNDS : MAX_ROUNDS;
+  const recoveryCap = patient ? PATIENT_RECOVERY_WAIT_MS : RECOVERY_WAIT_MS;
+  const deadline = Date.now() + (patient ? PATIENT_BATCH_BUDGET_MS : BATCH_BUDGET_MS);
   let sawRetryable = false;
   let cursor = pool.preferred;
 
-  for (let round = 1; round <= MAX_ROUNDS; round++) {
+  for (let round = 1; round <= maxRounds; round++) {
+    if (Date.now() >= deadline) break;
+
     let index = pool.findNext(cursor - 1);
     if (index < 0) {
-      // Nothing usable right now: wait only for a short outage, never for a quota block.
-      if (!sawRetryable || round === MAX_ROUNDS) break;
+      // Nothing usable right now. Standard mode waits out short blips only;
+      // patient mode also sits through long ones.
+      if (!sawRetryable) break;
       const wait = pool.earliestRecoveryMs();
-      if (wait > RECOVERY_WAIT_MS) break;
-      await sleep(Math.max(1000 * 2 ** (round - 1), wait));
+      if (!Number.isFinite(wait) || wait > recoveryCap) break;
+      await waitBefore(sleep, onEvent, capWait(Math.max(backoffFor(round), wait), deadline), 'every key is cooling down');
       continue;
     }
 
@@ -419,6 +596,7 @@ async function translateBatchWithFailover(pool, options) {
           label: endpoint.label,
           status: err instanceof GeminiError ? err.status : undefined,
           message: err.message,
+          retryDelayMs: err instanceof GeminiError ? err.retryDelayMs || null : null,
         });
         if (isRetryableError(err)) sawRetryable = true;
         pool.recordFailure(endpoint, err);
@@ -428,6 +606,7 @@ async function translateBatchWithFailover(pool, options) {
             batchStart: batchStart + 1,
             endpoint: describeEndpoint(endpoint),
             reason: err.message,
+            retryDelayMs: err instanceof GeminiError ? err.retryDelayMs || null : null,
             remaining: pool.available,
           });
         }
@@ -436,20 +615,25 @@ async function translateBatchWithFailover(pool, options) {
       if (index < 0 || index === firstIndex) break;
     }
 
-    if (round === MAX_ROUNDS || !sawRetryable) break;
-    const backoff = 1000 * 2 ** (round - 1);
+    if (round === maxRounds || !sawRetryable) break;
+    let pause = backoffFor(round);
     if (pool.findNext(pool.preferred - 1) < 0) {
       const wait = pool.earliestRecoveryMs();
-      if (wait > RECOVERY_WAIT_MS) break; // e.g. every key is quota-blocked
-      await sleep(Math.max(backoff, wait));
-    } else {
-      await sleep(backoff);
+      if (!Number.isFinite(wait) || wait > recoveryCap) break; // e.g. every key is quota-blocked for hours
+      pause = Math.max(pause, wait);
     }
+    await waitBefore(sleep, onEvent, capWait(pause, deadline), 'the last attempt failed');
     cursor = pool.preferred;
   }
 
-  throw buildExhaustedError(failures, pool);
+  throw buildExhaustedError(failures, pool, { patient });
 }
+
+/** Never sleep past the batch's time budget. */
+function capWait(ms, deadline) {
+  return Math.min(ms, Math.max(0, deadline - Date.now()));
+}
+
 
 /**
  * Translate parsed SRT entries with Gemini, in order, in batches.
@@ -470,6 +654,7 @@ async function translateEntries(entries, options) {
     onProgress,
     onEvent,
     stats,
+    patient = false,
     batchSize = BATCH_SIZE,
     sleep = defaultSleep,
   } = options || {};
@@ -516,6 +701,7 @@ async function translateEntries(entries, options) {
         sleep,
         onEvent,
         batchStart: start,
+        patient,
       });
 
       active = outcome.endpoint;
@@ -613,4 +799,9 @@ module.exports = {
   checkKeys,
   buildEndpoints,
   EndpointPool,
+  // retry-delay handling
+  parseDurationMs,
+  formatDuration,
+  extractRetryDelayMs,
+  extractQuotaModel,
 };

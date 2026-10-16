@@ -96,6 +96,7 @@ async function handleTranslate(req, res) {
   let keys = toStringList(payload.keys !== undefined && payload.keys !== null ? payload.keys : payload.apiKey);
   const model = typeof payload.model === 'string' ? payload.model.trim() : '';
   const fallbackModels = toStringList(payload.fallbackModels).filter((m) => m !== model);
+  const patient = payload.patient === true;
   const srt = typeof payload.srt === 'string' ? payload.srt : '';
 
   if (!keys.length) return sendJson(res, 400, { error: 'Please enter at least one Gemini API key.' });
@@ -132,6 +133,7 @@ async function handleTranslate(req, res) {
       keys,
       model,
       fallbackModels,
+      patient,
       baseUrl: process.env.GEMINI_BASE_URL || undefined,
       onProgress: (done, total, endpoint) => send({ type: 'progress', done, total, endpoint }),
       onEvent: (evt) => send(evt),
@@ -141,7 +143,7 @@ async function handleTranslate(req, res) {
     send({ type: 'result', srt: buildSrt(output), count: output.length, used: stats.used || [] });
   } catch (err) {
     if (err instanceof GeminiError) {
-      send({ type: 'error', message: err.message });
+      send({ type: 'error', message: err.message, hint: err.hint || null, failures: err.failures || [] });
     } else {
       console.error('Unexpected translation error:', err);
       send({ type: 'error', message: 'Unexpected server error while translating.' });
